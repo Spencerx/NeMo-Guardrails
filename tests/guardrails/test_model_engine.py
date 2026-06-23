@@ -35,8 +35,10 @@ from nemoguardrails.guardrails.model_engine import (
     _parse_chat_completion,
     _parse_chat_completion_chunk,
 )
+from nemoguardrails.guardrails.tool_schema import Toolset
 from nemoguardrails.rails.llm.config import Model
 from nemoguardrails.types import LLMResponse, LLMResponseChunk, UsageInfo
+from tests.guardrails.tool_helpers import make_tool_conversation
 
 
 def _make_model(
@@ -1917,3 +1919,142 @@ class TestParseChatCompletionChunk:
         assert result.model == "gpt-5"
         assert result.request_id == "chunk-1"
         assert result.finish_reason == "stop"
+
+
+_OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+            "strict": True,
+        },
+    },
+    {"type": "function", "function": {"name": "noargs"}},
+]
+
+
+class TestParseTools:
+    def test_parses_openai_chat_completions_tools(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        toolset = engine.parse_tools({"tools": _OPENAI_TOOLS})
+
+        assert isinstance(toolset, Toolset)
+        assert sorted(t.key for t in toolset.tools) == ["get_weather", "noargs"]
+
+        weather = toolset.get("get_weather")
+        assert weather is not None
+        assert weather.name == "get_weather"
+        assert weather.type == "function"
+        assert weather.description == "Get the weather for a city."
+        assert weather.arguments_schema == _OPENAI_TOOLS[0]["function"]["parameters"]
+        assert weather.strict is True
+
+    def test_nim_uses_the_same_shape(self):
+        engine = ModelEngine(_make_model(engine="nim"))
+        toolset = engine.parse_tools({"tools": _OPENAI_TOOLS})
+        assert sorted(t.key for t in toolset.tools) == ["get_weather", "noargs"]
+
+    def test_tool_without_parameters_has_no_arguments_schema(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        toolset = engine.parse_tools({"tools": _OPENAI_TOOLS})
+        noargs = toolset.get("noargs")
+        assert noargs is not None
+        assert noargs.arguments_schema is None
+
+    def test_no_tools_returns_empty_toolset(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        assert engine.parse_tools({}).tools == ()
+        assert engine.parse_tools(None).tools == ()
+        assert engine.parse_tools({"tools": []}).tools == ()
+
+    def test_malformed_entries_are_skipped(self):
+        """Non-dict / function-less entries are dropped so a malformed tool fails closed."""
+        engine = ModelEngine(_make_model(engine="openai"))
+        tools = [
+            "garbage",
+            {"type": "function"},
+            {"type": "function", "function": {"name": "ok"}},
+        ]
+        toolset = engine.parse_tools({"tools": tools})
+        assert [t.key for t in toolset.tools] == ["ok"]
+
+    def test_unknown_engine_falls_back_to_openai_parser(self):
+        engine = ModelEngine(_make_model(engine="vllm", parameters={"base_url": "http://localhost:8000"}))
+        toolset = engine.parse_tools({"tools": _OPENAI_TOOLS})
+        assert sorted(t.key for t in toolset.tools) == ["get_weather", "noargs"]
+
+    def test_function_entries_without_name_are_skipped(self):
+        """Name-less function entries are dropped, so duplicate empty keys never crash parse_tools."""
+        engine = ModelEngine(_make_model(engine="openai"))
+        tools = [
+            {"type": "function", "function": {"description": "no name"}},
+            {"type": "function", "function": {"name": ""}},
+            {"type": "function", "function": {"name": "ok"}},
+        ]
+        toolset = engine.parse_tools({"tools": tools})
+        assert [t.key for t in toolset.tools] == ["ok"]
+
+
+_TOOL_MESSAGES = make_tool_conversation()
+
+
+class TestExtractToolResults:
+    def test_extracts_openai_tool_result(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        results = engine.extract_tool_results(_TOOL_MESSAGES)
+
+        assert len(results) == 1
+        result = results[0]
+        assert result.call_id == "call_1"
+        assert result.name == "get_weather"
+        assert result.content == "18C"
+        assert result.is_error is False
+
+    def test_ignores_non_tool_messages(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        messages = [
+            {"role": "system", "content": "be helpful"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        assert engine.extract_tool_results(messages) == []
+
+    def test_extracts_multiple_results_in_order(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        messages = [
+            {"role": "tool", "tool_call_id": "call_1", "name": "a", "content": "r1"},
+            {"role": "tool", "tool_call_id": "call_2", "name": "b", "content": "r2"},
+        ]
+        results = engine.extract_tool_results(messages)
+        assert [r.call_id for r in results] == ["call_1", "call_2"]
+
+    def test_skips_non_dict_messages(self):
+        engine = ModelEngine(_make_model(engine="openai"))
+        messages = ["garbage", {"role": "tool", "tool_call_id": "call_1", "content": "r1"}]
+        results = engine.extract_tool_results(messages)
+        assert len(results) == 1
+        assert results[0].call_id == "call_1"
+
+    def test_missing_fields_become_none(self):
+        """Missing tool_call_id/name still extracts; the rail (not the extractor) judges linkage."""
+        engine = ModelEngine(_make_model(engine="openai"))
+        results = engine.extract_tool_results([{"role": "tool", "content": "r1"}])
+        assert len(results) == 1
+        assert results[0].call_id is None
+        assert results[0].name is None
+
+    def test_nim_uses_the_same_shape(self):
+        engine = ModelEngine(_make_model(engine="nim"))
+        results = engine.extract_tool_results(_TOOL_MESSAGES)
+        assert [r.call_id for r in results] == ["call_1"]
+
+    def test_unknown_engine_falls_back_to_openai_extractor(self):
+        engine = ModelEngine(_make_model(engine="vllm", parameters={"base_url": "http://localhost:8000"}))
+        results = engine.extract_tool_results(_TOOL_MESSAGES)
+        assert [r.call_id for r in results] == ["call_1"]
