@@ -24,7 +24,7 @@ unsafe result cancels remaining rails immediately.
 import asyncio
 import logging
 from collections.abc import Coroutine, Mapping
-from typing import TYPE_CHECKING, Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
 
 from nemoguardrails.guardrails.actions.content_safety_action import (
     ContentSafetyInputAction,
@@ -43,7 +43,7 @@ from nemoguardrails.guardrails.guardrails_types import (
 from nemoguardrails.guardrails.rail_action import RailAction
 from nemoguardrails.guardrails.telemetry import mark_rail_stop, rail_span, set_rail_content
 from nemoguardrails.guardrails.tool_rail_action import ToolRailAction
-from nemoguardrails.guardrails.tool_schema import ToolResult, Toolset
+from nemoguardrails.guardrails.tool_schema import ToolExchange, Toolset
 from nemoguardrails.llm.taskmanager import LLMTaskManager
 from nemoguardrails.rails.llm.config import _get_flow_name
 from nemoguardrails.types import ToolCall
@@ -179,61 +179,118 @@ class RailsManager:
             actions[flow] = action
         return actions
 
-    async def is_input_safe(self, messages: list[dict]) -> RailResult:
-        """Run all enabled input rails, short-circuiting on the first failure.
+    async def is_input_safe(self, messages: list[dict], *, enabled: Union[bool, list[str]] = True) -> RailResult:
+        """Run the enabled input rails, short-circuiting on the first failure.
 
-        When parallel mode is enabled, all rails run concurrently and the first
-        unsafe result cancels remaining rails.
+        The per-request *enabled* toggle selects which configured input rails run:
+        ``True`` (the default) runs all, ``False`` runs none, and a list runs only the
+        named flows (matched on the normalized flow name). When parallel mode is enabled,
+        all selected rails run concurrently and the first unsafe result cancels the rest.
         """
-        if not self.input_flows:
+        active = self._enabled_flows(self.input_flows, enabled)
+        if not active:
             return RailResult(is_safe=True)
 
-        rails = {flow: self._run_rail(flow, RailDirection.INPUT, messages) for flow in self.input_flows}
+        rails = {flow: self._run_rail(flow, RailDirection.INPUT, messages) for flow in active}
         if self.input_parallel:
             return await self._run_rails_parallel(rails, RailDirection.INPUT)
         return await self._run_rails_sequential(rails, RailDirection.INPUT)
 
-    async def is_output_safe(self, messages: list[dict], response: str) -> RailResult:
-        """Run all enabled output rails, short-circuiting on the first failure.
+    async def is_output_safe(
+        self, messages: list[dict], response: str, *, enabled: Union[bool, list[str]] = True
+    ) -> RailResult:
+        """Run the enabled output rails, short-circuiting on the first failure.
 
-        When parallel mode is enabled, all rails run concurrently and the first
-        unsafe result cancels remaining rails.
+        The per-request *enabled* toggle selects which configured output rails run:
+        ``True`` (the default) runs all, ``False`` runs none, and a list runs only the
+        named flows (matched on the normalized flow name). When parallel mode is enabled,
+        all selected rails run concurrently and the first unsafe result cancels the rest.
         """
-        if not self.output_flows:
+        active = self._enabled_flows(self.output_flows, enabled)
+        if not active:
             return RailResult(is_safe=True)
 
-        rails = {
-            flow: self._run_rail(flow, RailDirection.OUTPUT, messages, bot_response=response)
-            for flow in self.output_flows
-        }
+        rails = {flow: self._run_rail(flow, RailDirection.OUTPUT, messages, bot_response=response) for flow in active}
         if self.output_parallel:
             return await self._run_rails_parallel(rails, RailDirection.OUTPUT)
         return await self._run_rails_sequential(rails, RailDirection.OUTPUT)
 
-    async def are_tool_calls_safe(self, tool_calls: list[ToolCall], toolset: Toolset) -> RailResult:
-        """Run all enabled tool-call rails against the model's tool calls.
+    async def are_tool_calls_safe(
+        self,
+        tool_calls: list[ToolCall],
+        llm_params: Optional[dict],
+        *,
+        enabled: Union[bool, list[str]] = True,
+        model_type: str = "main",
+    ) -> RailResult:
+        """Validate the model's emitted tool calls (OUTPUT-direction tool rail).
 
-        Rails run sequentially, short-circuiting on the first failure.
-        Returns safe when no tool-call rails are configured.
+        The tool-call counterpart to :meth:`is_output_safe`: takes the model's output
+        (``tool_calls``) plus the request's declared tools (``llm_params``) and returns
+        a ``RailResult``.
         """
-        if not self.tool_call_flows:
+        active = self._enabled_flows(list(self._tool_call_actions), enabled)
+        if not active or not tool_calls:
             return RailResult(is_safe=True)
+        try:
+            toolset = self.engine_registry.parse_tools(model_type, llm_params)
+        except Exception as e:
+            log.warning("[%s] tool parsing failed; blocking tool calls: %s", get_request_id(), e)
+            return RailResult(is_safe=False, reason=f"tool parsing failed: {e}")
 
-        rails = {flow: self._run_tool_call_rail(flow, tool_calls, toolset) for flow in self.tool_call_flows}
+        rails = {flow: self._run_tool_call_rail(flow, tool_calls, toolset) for flow in active}
         return await self._run_rails_sequential(rails, RailDirection.OUTPUT)
 
-    async def are_tool_results_safe(self, tool_results: list[ToolResult], prior_calls: list[ToolCall]) -> RailResult:
-        """Run all enabled tool-result rails against the results of tool calls.
+    async def are_tool_results_safe(
+        self,
+        messages: list[dict],
+        *,
+        enabled: Union[bool, list[str]] = True,
+        model_type: str = "main",
+    ) -> RailResult:
+        """Validate incoming tool results (INPUT-direction tool rail).
 
-        Validates the tool results (already normalized to ``ToolResult``) against
-        the prior tool calls the model made. Rails run sequentially, short-circuiting
-        on the first failure. Returns safe when no tool-result rails are configured.
+        The tool-result counterpart to :meth:`is_input_safe`: takes the conversation
+        ``messages`` and returns a ``RailResult``. Groups the conversation into per-turn
+        ``(calls, results)`` exchanges via the engine adapter and validates each result
+        against its own turn's calls, so call ids reused across turns (spec-allowed) are
+        not flagged as ambiguous duplicates.
         """
-        if not self.tool_result_flows:
+        active = self._enabled_flows(list(self._tool_result_actions), enabled)
+        if not active:
+            return RailResult(is_safe=True)
+        try:
+            exchanges = self.engine_registry.extract_tool_exchanges(model_type, messages)
+        except Exception as e:
+            log.warning("[%s] tool exchange extraction failed; blocking: %s", get_request_id(), e)
+            return RailResult(is_safe=False, reason=f"tool exchange extraction failed: {e}")
+        if not any(exchange.results for exchange in exchanges):
             return RailResult(is_safe=True)
 
-        rails = {flow: self._run_tool_result_rail(flow, tool_results, prior_calls) for flow in self.tool_result_flows}
+        rails = {flow: self._run_tool_result_rail(flow, exchanges) for flow in active}
         return await self._run_rails_sequential(rails, RailDirection.INPUT)
+
+    @staticmethod
+    def _enabled_flows(configured: list[str], enabled: Union[bool, list[str]]) -> list[str]:
+        """Resolve the per-request enable toggle into the configured flows to run.
+
+        ``True`` (the default) runs every configured flow; ``False`` runs none; a list
+        runs only the named flows that are configured, preserving configured order and
+        ignoring unknown names. The two booleans are spelled out as separate cases so a
+        non-empty list is never mistaken for ``True``.
+
+        List membership is compared on the normalized flow name (``_get_flow_name``),
+        the same way ``_create_action``, ``_build_tool_actions`` and ``unsupported_reason``
+        do, so a request toggle carrying the canonical rail name matches a configured flow
+        that carries a ``$model=``/``(...)`` suffix instead of silently dropping it
+        (fail-open). Shared by the input, output, and tool rail families.
+        """
+        if enabled is True:
+            return list(configured)
+        if enabled is False:
+            return []
+        requested = {_get_flow_name(name) or name for name in enabled}
+        return [flow for flow in configured if (_get_flow_name(flow) or flow) in requested]
 
     async def _run_rail(
         self,
@@ -273,19 +330,27 @@ class RailsManager:
                 )
             return result
 
-    async def _run_tool_result_rail(
-        self, flow: str, tool_results: list[ToolResult], prior_calls: list[ToolCall]
-    ) -> RailResult:
-        """Dispatch a single tool-result rail to its action, wrapped in an INPUT rail span."""
+    async def _run_tool_result_rail(self, flow: str, exchanges: list[ToolExchange]) -> RailResult:
+        """Validate each turn's results against that turn's calls, wrapped in an INPUT rail span.
+
+        Each exchange is validated independently so ``call_id`` linkage stays turn-local;
+        the first unsafe exchange short-circuits.
+        """
+        action = self._tool_result_actions[flow]
         with rail_span(self._tracer, flow, RailDirection.INPUT) as span:
-            result = await self._tool_result_actions[flow].run(tool_results, prior_calls)
+            result = RailResult(is_safe=True)
+            for exchange in exchanges:
+                result = await action.run(exchange.results, exchange.calls)
+                if not result.is_safe:
+                    break
             mark_rail_stop(span, result.is_safe)
             if self._content_capture_enabled:
+                all_results = [r for exchange in exchanges for r in exchange.results]
                 set_rail_content(
                     span,
                     {
                         "tool_results": [
-                            {"call_id": r.call_id, "name": r.name, "is_error": r.is_error} for r in tool_results
+                            {"call_id": r.call_id, "name": r.name, "is_error": r.is_error} for r in all_results
                         ]
                     },
                     reason=result.reason if not result.is_safe else None,
